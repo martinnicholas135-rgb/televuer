@@ -195,6 +195,8 @@ class TeleData:
     right_hand_squeezeValue: float = 0.0   # (0.0 → 1.0) degree of hand squeeze
 
     motion_data_ready: bool = False        # True after the first hand or controller motion data event is received
+    left_arm_is_valid: bool = False        # True if the left arm pose matrix passed validation
+    right_arm_is_valid: bool = False       # True if the right arm pose matrix passed validation
     # controller tracking
     # https://docs.vuer.ai/en/latest/examples/20_motion_controllers.html
     # https://immersive-web.github.io/webxr-gamepads-module/
@@ -404,6 +406,8 @@ class TeleVuerWrapper:
                 left_hand_rot=left_Brobot_arm_hand_rot,
                 right_hand_rot=right_Brobot_arm_hand_rot,
                 motion_data_ready=self.tvuer.motion_data_ready,
+                left_arm_is_valid=left_arm_is_valid,
+                right_arm_is_valid=right_arm_is_valid,
                 left_hand_pinch=self.tvuer.left_hand_pinch,
                 left_hand_pinchValue=self.tvuer.left_hand_pinchValue * 100.0,
                 left_hand_squeeze=self.tvuer.left_hand_squeeze,
@@ -416,8 +420,11 @@ class TeleVuerWrapper:
         # controller tracking
         else:
             # Controller pose data directly follows the (initial pose) Unitree Humanoid Arm URDF Convention (thus no transform is needed).
-            left_IPunitree_Bxr_world_arm, left_arm_is_valid  = safe_mat_update(CONST_LEFT_ARM_POSE, self.tvuer.left_arm_pose)
-            right_IPunitree_Bxr_world_arm, right_arm_is_valid = safe_mat_update(CONST_RIGHT_ARM_POSE, self.tvuer.right_arm_pose)
+            left_arm_pose_raw = self.tvuer.left_arm_pose
+            right_arm_pose_raw = self.tvuer.right_arm_pose
+            motion_data_ready_raw = self.tvuer.motion_data_ready
+            left_IPunitree_Bxr_world_arm, left_arm_is_valid  = safe_mat_update(CONST_LEFT_ARM_POSE, left_arm_pose_raw)
+            right_IPunitree_Bxr_world_arm, right_arm_is_valid = safe_mat_update(CONST_RIGHT_ARM_POSE, right_arm_pose_raw)
 
             # Change basis convention
             Brobot_world_head = T_ROBOT_OPENXR @ Bxr_world_head @ T_OPENXR_ROBOT
@@ -434,7 +441,9 @@ class TeleVuerWrapper:
                 head_pose=Brobot_world_head,
                 left_wrist_pose=left_IPunitree_Brobot_waist_arm,
                 right_wrist_pose=right_IPunitree_Brobot_waist_arm,
-                motion_data_ready=self.tvuer.motion_data_ready,
+                motion_data_ready=motion_data_ready_raw,
+                left_arm_is_valid=left_arm_is_valid,
+                right_arm_is_valid=right_arm_is_valid,
                 left_ctrl_trigger=self.tvuer.left_ctrl_trigger,
                 left_ctrl_triggerValue=10.0 - self.tvuer.left_ctrl_triggerValue * 10,
                 left_ctrl_squeeze=self.tvuer.left_ctrl_squeeze,

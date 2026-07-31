@@ -6,6 +6,7 @@ import asyncio
 import threading
 import cv2
 import os
+import time
 from pathlib import Path
 from typing import Literal
 
@@ -88,7 +89,14 @@ class TeleVuer:
                     cert_file = cert_file or str(current_module_dir / "cert.pem")
                     key_file = key_file or str(current_module_dir / "key.pem")
 
-        self.vuer = Vuer(host='0.0.0.0', cert=cert_file, key=key_file, queries=dict(grid=False), queue_len=3)
+        advertise_host = os.getenv("XR_TELEOP_ADVERTISE_HOST")
+        if advertise_host:
+            os.environ["VUER_EXTERNAL_HOST"] = advertise_host
+        else:
+            os.environ.pop("VUER_EXTERNAL_HOST", None)
+            os.environ.setdefault("XR_TELEOP_ADVERTISE_INTERFACE", "wlan0")
+
+        self.vuer = Vuer(host="0.0.0.0", cert=cert_file, key=key_file, queries=dict(grid=False), queue_len=3)
         self.vuer.add_handler("CAMERA_MOVE")(self.on_cam_move)
         if self.use_hand_tracking:
             self.vuer.add_handler("HAND_MOVE")(self.on_hand_move)
@@ -173,11 +181,17 @@ class TeleVuer:
             self.right_ctrl_aButton_shared = Value('b', False, lock=True)
             self.right_ctrl_bButton_shared = Value('b', False, lock=True)
 
+        self._last_valid_dual_controller_packet_time = None
+        self._last_valid_dual_controller_packet_lock = threading.Lock()
+        self._controller_watchdog_stop_event = threading.Event()
+
         self.process = Process(target=self._vuer_run)
         self.process.daemon = True
         self.process.start()
     
     def _vuer_run(self):
+        if not self.use_hand_tracking:
+            threading.Thread(target=self._controller_stream_watchdog, daemon=True).start()
         try:
             self.vuer.run()
         except KeyboardInterrupt:
@@ -185,8 +199,25 @@ class TeleVuer:
         except Exception as e:
             print(f"Vuer encountered an error: {e}")
         finally:
+            self._controller_watchdog_stop_event.set()
             if hasattr(self, "stop_writer_event"):
                 self.stop_writer_event.set()
+
+    def _controller_stream_watchdog(self):
+        while not self._controller_watchdog_stop_event.is_set():
+            time.sleep(0.05)
+            now = time.monotonic()
+            with self._last_valid_dual_controller_packet_lock:
+                last_valid = self._last_valid_dual_controller_packet_time
+                if last_valid is None:
+                    continue
+                age = now - last_valid
+                if age <= 0.5:
+                    continue
+                with self.motion_data_ready_shared.get_lock():
+                    was_ready = bool(self.motion_data_ready_shared.value)
+                    if was_ready:
+                        self.motion_data_ready_shared.value = False
 
     def _xr_render_loop(self):
         while not self.stop_writer_event.is_set():
@@ -207,6 +238,7 @@ class TeleVuer:
         self.new_frame_event.set()
 
     def close(self):
+        self._controller_watchdog_stop_event.set()
         self.process.terminate()
         self.process.join(timeout=0.5)
         if self.display_mode in ("immersive", "ego") and not self.webrtc:
@@ -229,11 +261,56 @@ class TeleVuer:
     async def on_controller_move(self, event, session, fps=60):
         """https://docs.vuer.ai/en/latest/examples/20_motion_controllers.html"""
         try:
+            def is_unavailable_controller_pose(value):
+                if type(value).__name__ != "ExtType":
+                    return False
+                data = getattr(value, "data", None)
+                if isinstance(data, memoryview):
+                    data = data.tobytes()
+                return getattr(value, "code", None) == 0 and data == b"\x00"
+
+            def normalise_controller_pose(value):
+                if is_unavailable_controller_pose(value):
+                    return None, "controller_pose_unavailable"
+                try:
+                    pose = np.asarray(value, dtype=float)
+                except (TypeError, ValueError):
+                    return None, "not_convertible_to_float_array"
+                if pose.size != 16:
+                    return None, f"expected_16_values_got_{pose.size}"
+                if pose.shape == (4, 4):
+                    return pose.reshape(16, order="F"), None
+                return pose.reshape(16), None
+
+            value = getattr(event, "value", None)
+            has_left = isinstance(value, dict) and "left" in value
+            has_right = isinstance(value, dict) and "right" in value
+            left_value = value.get("left") if isinstance(value, dict) else None
+            right_value = value.get("right") if isinstance(value, dict) else None
+            left_pose, left_skip_reason = normalise_controller_pose(left_value)
+            right_pose, right_skip_reason = normalise_controller_pose(right_value)
+            now = time.monotonic()
+            if left_pose is None or right_pose is None:
+                unavailable_sides = []
+                if is_unavailable_controller_pose(left_value):
+                    unavailable_sides.append("left")
+                if is_unavailable_controller_pose(right_value):
+                    unavailable_sides.append("right")
+                last_valid_age = None
+                with self._last_valid_dual_controller_packet_lock:
+                    last_valid = self._last_valid_dual_controller_packet_time
+                    if last_valid is not None:
+                        last_valid_age = now - last_valid
+                    if last_valid_age is None or last_valid_age > 0.5:
+                        with self.motion_data_ready_shared.get_lock():
+                            self.motion_data_ready_shared.value = False
+                return
+
             # ControllerData
             with self.left_arm_pose_shared.get_lock():
-                self.left_arm_pose_shared[:] = event.value["left"]
+                self.left_arm_pose_shared[:] = left_pose
             with self.right_arm_pose_shared.get_lock():
-                self.right_arm_pose_shared[:] = event.value["right"]
+                self.right_arm_pose_shared[:] = right_pose
             # ControllerState
             left_controller = event.value["leftState"]
             right_controller = event.value["rightState"]
@@ -262,10 +339,13 @@ class TeleVuer:
 
             extract_controllers(left_controller, "left")
             extract_controllers(right_controller, "right")
-            with self.motion_data_ready_shared.get_lock():
-                self.motion_data_ready_shared.value = True
-        except:
+            with self._last_valid_dual_controller_packet_lock:
+                self._last_valid_dual_controller_packet_time = time.monotonic()
+                with self.motion_data_ready_shared.get_lock():
+                    self.motion_data_ready_shared.value = True
+        except Exception:
             pass
+
 
     async def on_hand_move(self, event, session, fps=60):
         """https://docs.vuer.ai/en/latest/examples/19_hand_tracking.html"""
